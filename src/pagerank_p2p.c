@@ -1,7 +1,3 @@
-/*
- * Scenario 1: Point-to-Point Blocking Communication
- * Uses MPI_Send / MPI_Recv to exchange ghost cell PR values
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,23 +14,16 @@ void pagerank_p2p(LocalGraph *lg, int rank, int num_ranks,
 
     int N = total_N;
 
-    // Global PR array — each rank keeps a full copy (needed to look up
-    // remote PR values after exchange)
     double *global_pr = malloc(N * sizeof(double));
 
     // Initialize global_pr from local values
     for (int i = 0; i < N; i++) global_pr[i] = 1.0 / N;
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
-
-        // ── Exchange: rank 0 collects all PR, sends back full array ──────
-        // (Manual P2P handshake as required by Scenario 1)
         if (rank == 0) {
-            // Copy own values
             for (int li = 0; li < lg->local_n; li++)
                 global_pr[lg->global_ids[li]] = lg->pr[li];
 
-            // Receive from all other ranks
             for (int r = 1; r < num_ranks; r++) {
                 int count;
                 MPI_Recv(&count, 1, MPI_INT, r, 10, comm, MPI_STATUS_IGNORE);
@@ -60,7 +49,7 @@ void pagerank_p2p(LocalGraph *lg, int rank, int num_ranks,
             MPI_Recv(global_pr, N, MPI_DOUBLE, 0, 13, comm, MPI_STATUS_IGNORE);
         }
 
-        // ── Local PageRank update ─────────────────────────────────────────
+        // ── Local PageRank update ───
         double local_residual = 0.0;
 
         for (int li = 0; li < lg->local_n; li++) {
@@ -79,12 +68,11 @@ void pagerank_p2p(LocalGraph *lg, int rank, int num_ranks,
             local_residual += fabs(lg->pr_new[li] - lg->pr[li]);
         }
 
-        // ── Convergence check ─────────────────────────────────────────────
+        // ── Convergence check ──
         double global_residual = 0.0;
         MPI_Allreduce(&local_residual, &global_residual,
                       1, MPI_DOUBLE, MPI_SUM, comm);
 
-        // Swap PR arrays
         double *tmp = lg->pr;
         lg->pr      = lg->pr_new;
         lg->pr_new  = tmp;

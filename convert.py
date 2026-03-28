@@ -1,5 +1,7 @@
 # Converts web-Google.txt edge list to METIS graph format
-# Usage: python3 convert.py web-Google.txt web-Google.metis
+# Usage:
+#   python convert.py
+#   python convert.py web-Google.txt web-Google.metis
 
 import sys
 from collections import defaultdict
@@ -64,5 +66,21 @@ def convert(input_file, output_file):
     print(f"Output: {output_file}.edges (directed edges for PageRank)")
 
 if __name__ == '__main__':
-    convert(sys.argv[1], sys.argv[2])
+    default_input = 'web-Google.txt'
+    default_output = 'web-Google.metis'
+
+    if len(sys.argv) == 1:
+        input_file = default_input
+        output_file = default_output
+        print(f'No arguments provided. Using defaults: {input_file} -> {output_file}')
+    elif len(sys.argv) == 3:
+        input_file = sys.argv[1]
+        output_file = sys.argv[2]
+    else:
+        script_name = sys.argv[0] if sys.argv else 'convert.py'
+        print('Usage: python convert.py [input_edge_list.txt output_metis_file]')
+        print(f'Example: {script_name} web-Google.txt web-Google.metis')
+        sys.exit(1)
+
+    convert(input_file, output_file)
 

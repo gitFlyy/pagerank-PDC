@@ -1,10 +1,3 @@
-/*
- * Name: Humayun
- * Assignment: 3 - Scalable PageRank Engine
- * Course: Parallel and Distributive Computing (CS 3006)
- *
- * main.c - Entry point, handles init/teardown and calls the correct scenario
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +5,6 @@
 #include <mpi.h>
 #include "graph_utils.h"
 
-// Forward declarations for the 3 scenarios
 void pagerank_p2p        (LocalGraph *lg, int rank, int num_ranks,
                           MPI_Comm comm, int total_N);
 void pagerank_collective (LocalGraph *lg, int rank, int num_ranks,
@@ -34,7 +26,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // ── Step 1: Rank 0 loads the full graph ──────────────────────────────
     Graph *g = NULL;
     if (rank == 0) {
         printf("=== PageRank Engine (Scenario %d) ===\n", SCENARIO);
@@ -42,7 +33,6 @@ int main(int argc, char *argv[]) {
         g = load_graph(argv[1]);
     }
 
-    // ── Step 2: Partition with ParMETIS ──────────────────────────────────
     idx_t *partition = NULL;
     int total_N = 0;
 
@@ -51,22 +41,18 @@ int main(int argc, char *argv[]) {
 
     partition = partition_graph(g, num_ranks, MPI_COMM_WORLD);
 
-    // ── Step 3: Distribute graph to all ranks ────────────────────────────
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0) printf("[Rank 0] Distributing graph...\n");
 
     LocalGraph *lg = distribute_graph(g, partition,
                                       rank, num_ranks, MPI_COMM_WORLD);
 
-    // Rank 0 no longer needs full graph
     if (rank == 0) free_graph(g);
     free(partition);
 
-    // ── Step 4: Classify vertices (internal / boundary / ghost) ──────────
     MPI_Barrier(MPI_COMM_WORLD);
     classify_vertices(lg, rank, num_ranks);
 
-    // ── Step 5: Run the selected scenario ────────────────────────────────
     MPI_Barrier(MPI_COMM_WORLD);
     double t_start = MPI_Wtime();
 
@@ -85,14 +71,11 @@ int main(int argc, char *argv[]) {
 
     double t_end = MPI_Wtime();
 
-    // ── Step 6: Print timing ─────────────────────────────────────────────
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0) {
         printf("\n=== Total wall time: %.4f seconds ===\n", t_end - t_start);
     }
 
-    // ── Step 7: Print top 10 PageRank results (rank 0 collects) ──────────
-    // Gather all PR values to rank 0
     int *all_counts   = NULL;
     int *displs       = NULL;
     double *global_pr = NULL;
@@ -122,7 +105,6 @@ int main(int argc, char *argv[]) {
                 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        // Simple top-10 extraction
         printf("\n--- Top 10 Vertices by PageRank ---\n");
         for (int t = 0; t < 10; t++) {
             double best = -1.0;
@@ -132,7 +114,7 @@ int main(int argc, char *argv[]) {
                     { best = global_pr[i]; best_i = i; }
             printf("  #%2d  vertex %7d  PR = %.8f\n",
                    t+1, global_gids[best_i], best);
-            global_pr[best_i] = -1.0; // mark as used
+            global_pr[best_i] = -1.0;
         }
         free(all_counts); free(displs);
         free(global_pr);  free(global_gids);

@@ -1,8 +1,3 @@
-/*
- * Scenario 3: Asynchronous Communication-Computation Overlap
- * Uses MPI_Isend/Irecv to hide communication latency behind
- * computation of Internal Vertices (those needing no remote data)
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,8 +59,7 @@ void pagerank_async(LocalGraph *lg, int rank, int num_ranks,
                       r, 20, comm, &requests[req_count++]);
         }
 
-        // ── Phase 2: Compute INTERNAL vertices while comms in flight ──────
-        // This is the key overlap: internal vertices don't need remote data
+
         double local_residual = 0.0;
 
         for (int ii = 0; ii < lg->num_internal; ii++) {
@@ -112,7 +106,7 @@ void pagerank_async(LocalGraph *lg, int rank, int num_ranks,
             local_residual += fabs(lg->pr_new[li] - lg->pr[li]);
         }
 
-        // ── Convergence check ─────────────────────────────────────────────
+        // ── Convergence check ─────
         double global_residual = 0.0;
         MPI_Allreduce(&local_residual, &global_residual,
                       1, MPI_DOUBLE, MPI_SUM, comm);

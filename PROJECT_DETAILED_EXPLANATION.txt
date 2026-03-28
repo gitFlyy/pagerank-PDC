@@ -1,0 +1,878 @@
+Scalable PageRank Engine - Detailed Project Explanation
+=====================================================
+
+Author in source: Humayun
+Course context in source: Parallel and Distributive Computing (CS 3006)
+
+
+1) What This Project Does
+-------------------------
+This project builds a distributed PageRank solver in C using MPI, with three communication strategies:
+
+1. Scenario 1: Point-to-point blocking communication (MPI_Send, MPI_Recv)
+2. Scenario 2: Collective communication (MPI_Allgatherv)
+3. Scenario 3: Asynchronous overlap (MPI_Isend, MPI_Irecv, MPI_Waitall)
+
+The input graph is a directed edge list in a custom .edges format. The project also provides a Python converter that turns web-Google.txt into:
+
+1. METIS adjacency format for partitioning support
+2. A remapped directed .edges file for PageRank computation
+3. A node ID mapping file
+
+
+2) End-to-End Data Flow
+-----------------------
+Step A: Convert dataset
+- Script: convert.py
+- Reads web-Google.txt
+- Writes:
+  - web-Google.metis
+  - web-Google.metis.mapping
+  - web-Google.metis.edges
+
+Step B: Build binaries
+- Makefile builds:
+  - pagerank_p2p
+  - pagerank_collective
+  - pagerank_async
+
+Step C: Run with mpirun
+- Example:
+  mpirun -np 4 ./pagerank_p2p web-Google.metis.edges
+
+Step D: Runtime pipeline inside C program
+1. MPI initialized
+2. Rank 0 loads whole graph
+3. Graph partition array built and broadcast
+4. Data distributed to each rank
+5. Vertices classified into internal/boundary
+6. Selected scenario runs iterative PageRank
+7. Rank 0 prints timing + top 10 vertices
+
+
+3) Core Algorithm: PageRank
+---------------------------
+For each vertex i:
+PR_new(i) = (1 - d) / N + d * sum over all incoming neighbors j of i: PR(j)/out_degree(j)
+
+Where:
+- d is damping factor (0.85 in this code)
+- N is total number of vertices
+- incoming neighbors of i are all j such that edge j -> i exists
+
+Convergence in this project:
+- Residual per rank = sum of abs(PR_new - PR_old) over local vertices
+- Global residual = MPI_Allreduce(sum across ranks)
+- Stop when global residual < 1e-7, or after 200 iterations
+
+
+4) File-by-File Explanation
+---------------------------
+
+4.1 convert.py
+--------------
+Purpose:
+- Preprocess raw edge list into formats needed for partitioning and PageRank runs.
+
+Important concepts used:
+- Python dictionaries/sets for remapping and adjacency building
+- ID normalization: original IDs -> contiguous IDs [0, N-1]
+- Writing both undirected and directed outputs for different tasks
+
+Function: convert(input_file, output_file)
+What it does in order:
+1. Reads raw edge list; ignores comment lines and malformed lines
+2. Collects all nodes and edges
+3. Remaps node IDs to dense range [0, N-1]
+4. Builds undirected adjacency for METIS output
+5. Writes METIS format file:
+   - first line: N and undirected edge count
+   - one line per vertex: 1-based neighbor IDs
+6. Writes mapping file old_id -> new_id
+7. Writes directed .edges file for PageRank:
+   - first line: N E
+   - then each edge u v in remapped IDs
+
+Why directed and undirected outputs both exist:
+- METIS graph format expects undirected adjacency
+- PageRank needs directed in-neighbors and out-degrees
+
+Main block behavior:
+- No args: defaults to web-Google.txt -> web-Google.metis
+- Two args: uses provided input and output
+- Otherwise prints usage and exits
+
+
+4.2 Makefile
+------------
+Purpose:
+- Compile three executables, each selecting one scenario by preprocessor macro.
+
+Variables:
+- PARMETIS_DIR, METIS_DIR: include and lib paths
+- CC = mpicc: use MPI compiler wrapper
+- CFLAGS: optimization, warnings, include paths
+- LDFLAGS: library search paths and link libs
+
+Targets:
+- all: builds all three scenario binaries
+- pagerank_p2p: compiles with -DSCENARIO=1
+- pagerank_collective: compiles with -DSCENARIO=2
+- pagerank_async: compiles with -DSCENARIO=3
+- clean: removes binaries
+
+Key concept:
+- Same main.c binary logic is compiled three times with different compile-time macro values.
+
+
+4.3 src/graph_utils.h
+---------------------
+Purpose:
+- Shared type definitions and function prototypes.
+
+Struct: Graph
+- Stores full graph on rank 0 using CSR format for outgoing and incoming edges.
+Fields:
+- num_vertices, num_edges
+- row_ptr, col_idx for outgoing CSR
+- in_row_ptr, in_col_idx for incoming CSR
+- out_degree for each vertex
+
+Struct: LocalGraph
+- Stores per-rank partition and PR state.
+Fields include:
+- local_n and global_ids
+- local incoming CSR
+- replicated global out_degree array
+- internal/boundary vertex lists
+- ghost metadata and buffers
+- pr and pr_new arrays
+
+Declared functions:
+- load_graph
+- free_graph
+- partition_graph
+- distribute_graph
+- classify_vertices
+- free_local_graph
+- print_stats
+
+
+4.4 src/main.c
+--------------
+Purpose:
+- Program entry, orchestration, scenario selection, final reporting.
+
+Function: main(int argc, char *argv[])
+Detailed flow:
+1. MPI_Init
+2. Get rank and num_ranks
+3. Validate argument edges file
+4. Rank 0 loads graph with load_graph
+5. Broadcast total_N
+6. partition_graph called
+7. distribute_graph called
+8. Full graph freed on rank 0; partition array freed everywhere
+9. classify_vertices called
+10. Start timing with MPI_Wtime
+11. Compile-time #if SCENARIO chooses one function:
+    - pagerank_p2p
+    - pagerank_collective
+    - pagerank_async
+12. End timing and print total wall time on rank 0
+13. Gather PR + global vertex IDs with MPI_Gather and MPI_Gatherv
+14. Rank 0 extracts top 10 PR values by repeated linear max scan
+15. Cleanup and MPI_Finalize
+
+Concepts used:
+- MPI world communicator
+- Broadcast, barrier, gather, gatherv
+- Compile-time scenario selection via preprocessor
+- Root-only I/O and reporting
+
+
+4.5 src/graph_utils.c
+---------------------
+
+Function: Graph* load_graph(const char *edges_file)
+Purpose:
+- Load directed graph and build CSR for outgoing and incoming edges.
+
+How it works:
+1. Read header N and E
+2. Read E edge pairs into temporary arrays src/dst
+3. Compute out_degree, ignoring self-loops
+4. Build outgoing CSR (row_ptr, col_idx)
+5. Compute in-degree and build incoming CSR (in_row_ptr, in_col_idx)
+6. Free temporaries
+7. Return heap-allocated Graph
+
+Important notes:
+- Self loops are skipped in degree/csr contribution
+- Uses two-pass CSR construction pattern
+
+Function: void free_graph(Graph *g)
+Purpose:
+- Free all heap arrays in Graph and the Graph object.
+
+Function: idx_t* partition_graph(Graph *g, int num_ranks, MPI_Comm comm)
+Purpose:
+- Produce ownership array partition[i] = owner rank for vertex i.
+
+Actual behavior in this code:
+- Uses linear block partition, not true ParMETIS partitioning
+- Rank 0 computes contiguous chunks
+- Broadcasts global_part to all ranks
+
+Why linear partition might be used:
+- Deterministic and simple
+- Works even if advanced partitioning calls are unavailable
+- May reduce partition quality vs real graph cut minimization
+
+Function: LocalGraph* distribute_graph(Graph *g, idx_t *partition, ...)
+Purpose:
+- Build each rank's local graph data.
+
+Major steps:
+1. Broadcast N
+2. Count vertices per rank
+3. Send global vertex IDs to each rank
+4. Broadcast full out_degree array to all ranks
+5. Build local incoming CSR for each rank from global incoming CSR
+6. Rank 0 sends remote ranks their local CSR slices
+7. Initialize pr to uniform 1/N
+
+Design choice:
+- out_degree is replicated globally on each rank to simplify PR update.
+
+Function: void classify_vertices(LocalGraph *lg, int rank, int num_ranks)
+Purpose:
+- Split local vertices into internal and boundary.
+
+Definitions:
+- Internal vertex: all incoming neighbors are local
+- Boundary vertex: at least one incoming neighbor is remote
+
+How it determines locality:
+- Binary search of neighbor global ID in sorted local global_ids
+
+Then it builds ghost list:
+1. Collect remote neighbor IDs from boundary vertices
+2. Sort IDs
+3. Deduplicate
+4. Store in ghost arrays
+
+Note:
+- ghost_owner_rank is declared in struct but not populated/used in this implementation.
+
+Function: void free_local_graph(LocalGraph *lg)
+Purpose:
+- Free all local graph buffers and arrays.
+
+Function: void print_stats(int rank, int iter, double residual)
+Purpose:
+- Rank 0 prints iteration number and residual.
+
+
+4.6 src/pagerank_p2p.c (Scenario 1)
+------------------------------------
+Function: pagerank_p2p(...)
+Communication model:
+- Root-mediated manual exchange every iteration.
+
+Per iteration:
+1. Rank 0 receives local PR pieces from all ranks
+2. Rank 0 reconstructs full global_pr
+3. Rank 0 sends full global_pr to all ranks
+4. Every rank computes local PR update from global_pr
+5. MPI_Allreduce sums residual
+6. Swap pr and pr_new
+7. Stop on threshold
+
+Pros:
+- Easy to reason about
+- Explicit data movement
+
+Cons:
+- Root bottleneck
+- Multiple sends/receives per iteration
+- Poor scalability for large rank counts
+
+
+4.7 src/pagerank_collective.c (Scenario 2)
+-------------------------------------------
+Function: pagerank_collective(...)
+Communication model:
+- Uses MPI_Allgatherv so all ranks receive all local PR partitions.
+
+Setup once:
+1. MPI_Allgather local_n into counts
+2. Build displacements
+3. MPI_Allgatherv global_ids into all_gids
+
+Per iteration:
+1. MPI_Allgatherv local PR values into gathered_pr
+2. Remap gathered order into global_pr indexed by global vertex ID
+3. Local compute over incoming neighbors
+4. Global residual with MPI_Allreduce
+5. Swap arrays and convergence check
+
+Pros:
+- Simpler and typically faster than manual root gather+broadcast
+- No single root handling all traffic explicitly
+
+Cons:
+- Still all-to-all style synchronization
+- Full PR vector replicated on every rank
+
+
+4.8 src/pagerank_async.c (Scenario 3)
+--------------------------------------
+Function: pagerank_async(...)
+Communication model:
+- Non-blocking point-to-point with overlap.
+
+Setup:
+- Same counts/displs/all_gids setup as collective case
+- Allocate send/recv buffers for each rank
+
+Per iteration phases:
+1. Post Irecv from every rank
+2. Fill local send buffer and post Isend to every rank
+3. Compute internal vertices while communication is in flight
+4. Waitall for all outstanding requests
+5. Reconstruct global_pr from received buffers
+6. Compute boundary vertices
+7. Allreduce residual, swap, convergence
+
+Goal:
+- Hide communication time behind useful computation.
+
+Observed caveat in your runs:
+- Converges in 2 iterations, much faster than other scenarios.
+- This may indicate algorithmic or synchronization behavior differences that should be validated for numerical equivalence.
+
+
+5) Concepts and Data Structures in Depth
+----------------------------------------
+
+5.1 CSR (Compressed Sparse Row)
+- row_ptr has length N+1
+- col_idx has length number of stored edges
+- Edges of vertex i are in col_idx[row_ptr[i] ... row_ptr[i+1]-1]
+
+Why CSR:
+- Compact memory for sparse graphs
+- Fast row-wise traversal for neighbor iteration
+
+This project uses two CSR views:
+- outgoing CSR (for out-degree and potential traversal)
+- incoming CSR (for PageRank updates, since formula sums over in-neighbors)
+
+
+5.2 Partitioning and Ownership
+- partition[i] says which rank owns global vertex i
+- local_n is count of owned vertices on a rank
+- global_ids maps local index -> global vertex ID
+
+Why ownership matters:
+- Only owner stores and updates PR state for that vertex locally
+- Other ranks needing remote vertex values depend on communication
+
+
+5.3 Internal vs Boundary Vertices
+- Internal: update can be done from local data only
+- Boundary: depends on remote rank values
+
+Why classify:
+- Enables overlap in async strategy
+- Internal updates can proceed before remote values arrive
+
+
+5.4 Residual and Convergence
+Residual used:
+- L1 difference sum over all vertices between current and next PR vectors
+
+Global residual uses MPI_Allreduce with MPI_SUM.
+
+Why this is common:
+- Simple global stopping criterion
+- Robust for distributed iterations
+
+
+6) MPI APIs Used and Why
+------------------------
+
+MPI_Init / MPI_Finalize
+- Start and end MPI runtime.
+
+MPI_Comm_rank / MPI_Comm_size
+- Get rank ID and world size.
+
+MPI_Bcast
+- One-to-all distribution (N, partition, out_degree).
+
+MPI_Barrier
+- Synchronize ranks at phase boundaries (mostly for clean timing/ordering).
+
+MPI_Send / MPI_Recv
+- Blocking point-to-point transfer in Scenario 1 and graph distribution.
+
+MPI_Isend / MPI_Irecv
+- Non-blocking communication in Scenario 3 to overlap communication and compute.
+
+MPI_Waitall
+- Wait until all posted non-blocking operations complete.
+
+MPI_Allgather / MPI_Allgatherv
+- All ranks collect each rank's data.
+- Allgatherv supports variable data sizes per rank.
+
+MPI_Gather / MPI_Gatherv
+- Collect local final arrays to rank 0 for output.
+
+MPI_Allreduce
+- Sum residual across ranks for convergence test.
+
+MPI_Wtime
+- Wall-clock timer for elapsed runtime.
+
+MPI datatype/constants seen:
+- MPI_INT, MPI_DOUBLE
+- MPI_SUM
+- MPI_COMM_WORLD
+- MPI_STATUS_IGNORE, MPI_STATUSES_IGNORE
+
+
+7) OpenMP in This Project
+-------------------------
+No OpenMP directives are currently used in the source code.
+
+What this means:
+- There are no lines like #pragma omp parallel for.
+- Parallelism here is process-level distributed memory (MPI), not thread-level shared memory.
+
+If OpenMP were added, likely targets would be loops over local vertices:
+- for (int li = 0; li < lg->local_n; li++) { ... }
+
+Example of what an OpenMP directive would look like (not in current code):
+#pragma omp parallel for reduction(+:local_residual)
+for (int li = 0; li < lg->local_n; li++) {
+    ...
+}
+
+
+8) C Libraries and What They Provide
+-------------------------------------
+
+Standard C libraries:
+- stdio.h: printf, fprintf, fopen, fscanf, fclose, perror
+- stdlib.h: malloc, calloc, realloc, free, exit
+- string.h: memcpy
+- math.h: fabs
+
+MPI library:
+- mpi.h
+- Message passing runtime and communication primitives
+
+ParMETIS / METIS headers:
+- parmetis.h
+- Provides idx_t type and partitioning ecosystem integration
+
+Linking:
+- -lparmetis -lmetis -lm
+
+
+9) Preprocessor and Build Directives
+------------------------------------
+
+In C source:
+- #include: imports header declarations
+- #define DAMPING, THRESHOLD, MAX_ITER: compile-time constants
+- #if SCENARIO == X / #elif / #endif: compile-time branching
+
+In Makefile:
+- Variable assignment and expansion: CC, CFLAGS, LDFLAGS
+- Pattern of separate targets with -DSCENARIO set differently
+
+Why compile-time scenario selection:
+- Produces separate executables with simpler runtime path
+- Avoids runtime if/else overhead and branching complexity in final binary
+
+
+10) Code Examples for Key Ideas
+-------------------------------
+
+10.1 CSR edge range lookup
+Concept:
+- Incoming neighbors of local vertex li are in [in_row_ptr[li], in_row_ptr[li+1]).
+
+Example pattern used repeatedly:
+int start = lg->in_row_ptr[li];
+int end   = lg->in_row_ptr[li + 1];
+for (int e = start; e < end; e++) {
+    int j = lg->in_col_idx[e];
+    ...
+}
+
+10.2 PR update formula in code form
+lg->pr_new[li] = (1.0 - DAMPING) / N + DAMPING * sum;
+
+10.3 Global convergence reduction
+MPI_Allreduce(&local_residual, &global_residual,
+              1, MPI_DOUBLE, MPI_SUM, comm);
+
+10.4 Non-blocking overlap skeleton
+MPI_Irecv(...);
+MPI_Isend(...);
+compute_internal_vertices();
+MPI_Waitall(...);
+compute_boundary_vertices();
+
+
+11) Running the Project
+-----------------------
+
+11.1 Convert input once
+python3 convert.py web-Google.txt web-Google.metis
+
+11.2 Build
+make -j
+
+11.3 Run each scenario
+mpirun -np 4 ./pagerank_p2p web-Google.metis.edges
+mpirun -np 4 ./pagerank_collective web-Google.metis.edges
+mpirun -np 4 ./pagerank_async web-Google.metis.edges
+
+11.4 If rank count exceeds available hardware slots
+mpirun --oversubscribe -np 16 ./pagerank_p2p web-Google.metis.edges
+
+
+12) Practical Observations and Engineering Tradeoffs
+----------------------------------------------------
+
+Memory tradeoff:
+- Full global PR vector is replicated on every rank in all three scenarios.
+- Simpler indexing and implementation, but higher memory usage.
+
+Communication tradeoff:
+- Scenario 1: explicit, but root bottleneck
+- Scenario 2: concise and balanced, still synchronized each iteration
+- Scenario 3: attempts overlap to hide latency
+
+Partitioning tradeoff:
+- Current linear partition is easy and deterministic
+- Real graph partitioning can reduce edge cuts and communication volume
+
+
+13) Potential Issues to Be Aware Of
+-----------------------------------
+1. partition_graph comments mention ParMETIS but implementation is linear block partitioning.
+2. ghost_owner_rank is defined but not used.
+3. Async scenario converges in 2 iterations in your measured runs, much faster than other two; verify numerical quality by comparing final PR vectors and checking sum(PR).
+4. top-10 extraction on rank 0 is O(10*N) and mutates gathered PR buffer (fine for reporting, but note behavior).
+
+
+14) How to Read This Codebase Efficiently
+-----------------------------------------
+Recommended order:
+1. convert.py
+2. src/graph_utils.h
+3. src/main.c
+4. src/graph_utils.c
+5. src/pagerank_p2p.c
+6. src/pagerank_collective.c
+7. src/pagerank_async.c
+8. Makefile
+
+Learning strategy:
+- First understand data layout (Graph, LocalGraph)
+- Then understand one iteration of Scenario 1
+- Then compare what Scenario 2 and 3 change in communication pattern only
+
+
+15) Short Glossary
+------------------
+- Rank: one MPI process
+- Communicator: process group (MPI_COMM_WORLD)
+- CSR: compressed sparse row graph representation
+- Internal vertex: all required neighbors local
+- Boundary vertex: needs remote neighbor values
+- Ghost vertex: remote vertex value needed locally
+- Residual: convergence difference metric
+- Oversubscribe: run more MPI processes than CPU slots
+
+
+This document is intended as a complete conceptual and function-level guide to the current project implementation.
+
+
+16) Rubric-Wise Detailed Explanation (Point-by-Point)
+-----------------------------------------------------
+This section maps each rubric line item to:
+1. What the evaluator is checking
+2. How this project currently addresses it
+3. What evidence you should provide for full marks
+
+
+16.1 Functional Correctness (30 total)
+--------------------------------------
+
+A) 15 pts: Accurate PageRank power method and convergence
+What this means:
+- Your implementation must follow iterative PageRank power updates correctly.
+- The damping term and normalization must be correct.
+- Iterative convergence must be tracked with a valid residual criterion.
+
+Where it is implemented:
+- src/pagerank_p2p.c
+- src/pagerank_collective.c
+- src/pagerank_async.c
+
+Code-level indicators already present:
+- Formula: pr_new = (1 - DAMPING)/N + DAMPING * sum(PR(in-neighbor)/outdeg)
+- Damping value: 0.85
+- Residual: L1 norm over local vertices, then global sum via MPI_Allreduce
+- Stop condition: global residual < 1e-7 or MAX_ITER reached
+
+Why this satisfies the concept:
+- This is the standard power iteration form of PageRank on directed graphs.
+- All ranks contribute to global convergence using MPI_Allreduce, so stopping is globally consistent.
+
+What to show in report/demo for full score:
+1. Write the exact mathematical formula.
+2. Show one iteration pseudocode.
+3. Show residual curve (iteration vs residual) for at least one scenario.
+4. Show convergence iteration counts (for np=2,4,8,16).
+
+
+B) 15 pts: Successful validation and correct ranking on dataset
+What this means:
+- Output rankings should be plausible and stable.
+- At minimum, top-ranked nodes and PR sums should indicate valid results.
+
+Where it is implemented:
+- src/main.c gathers all local PR and prints top-10 vertices at rank 0.
+
+Current status:
+- Top-10 extraction exists and works.
+- Validation checks are not fully automated yet (for example sum(PR) approx 1.0 across scenarios).
+
+What evaluator likely expects:
+1. Correct and stable top-k ranking across equivalent runs.
+2. Basic sanity checks:
+  - sum(PR) approx 1
+  - all PR values non-negative
+  - ordering consistency against known references or between scenarios
+
+What to add in report for full marks:
+1. Table of top 10 vertices with PR scores per scenario.
+2. Compare overlap of top 10 sets across scenarios.
+3. Include a validation statement such as:
+  - "sum(PR)=0.999999..."
+  - "No negative PR values found"
+
+
+16.2 Data and Partitioning (20 total)
+-------------------------------------
+
+A) 10 pts: Correct METIS integration and edge-cut minimization
+What this means:
+- Data should be transformed into METIS-compatible format.
+- Partitioning strategy should attempt to reduce cross-rank communication (edge cuts).
+
+Where related pieces exist:
+- convert.py writes METIS adjacency file.
+- Makefile links with METIS/ParMETIS.
+- src/graph_utils.c contains partition_graph.
+
+Important reality in current code:
+- partition_graph currently uses linear block partitioning, not a true ParMETIS partition call.
+- So "METIS integration" is partial (format and linking yes, optimization-based partitioning no).
+
+Why this matters for scoring:
+- You may lose marks on "edge-cut minimization" if evaluator expects actual k-way graph partitioning.
+
+What to show or improve:
+1. In report, state clearly whether partitioning is linear or ParMETIS-driven.
+2. If possible, implement real ParMETIS k-way partitioning and report edge-cut reduction.
+3. Add metric:
+  - number of cross-partition edges
+  - communication volume proxy (ghost count)
+
+
+B) 10 pts: Data redistribution and Internal/Boundary/Ghost logic
+What this means:
+- After partitioning, each rank must receive correct local subgraph data.
+- Internal vs boundary classification should be correct.
+- Ghost dependencies should be identified correctly for remote data needs.
+
+Where implemented:
+- src/graph_utils.c
+  - distribute_graph
+  - classify_vertices
+
+What code does correctly:
+1. Sends local vertex ownership (global_ids) to each rank.
+2. Builds local incoming CSR for each rank.
+3. Classifies vertices as internal/boundary using locality check.
+4. Builds and deduplicates ghost vertex ID list.
+
+Current caveat:
+- ghost_owner_rank field exists in struct but is not populated or used.
+
+What to present for full marks:
+1. For each rank, print: local_n, internal, boundary, ghosts.
+2. Explain why internal vertices can be computed without remote communication.
+3. Show that boundary vertices correspond to cross-rank dependencies.
+
+
+16.3 MPI Scenarios (30 total)
+-----------------------------
+
+A) 5 pts: Scenario 1 (P2P Blocking)
+What evaluator checks:
+- Correct use of blocking point-to-point primitives.
+- Correct synchronization and data consistency.
+
+Where implemented:
+- src/pagerank_p2p.c
+
+Used MPI primitives:
+- MPI_Send, MPI_Recv, MPI_Allreduce
+
+Design summary:
+- Rank 0 gathers partial PR from all ranks and sends complete global PR back.
+
+Strength:
+- Clear and correct baseline.
+
+Limitation:
+- Root bottleneck at higher scale.
+
+
+B) 10 pts: Scenario 2 (Collectives / Allgatherv)
+What evaluator checks:
+- Correct use of collective communication.
+- Proper variable-size data gathering with counts/displacements.
+
+Where implemented:
+- src/pagerank_collective.c
+
+Used MPI primitives:
+- MPI_Allgather, MPI_Allgatherv, MPI_Allreduce
+
+Design summary:
+- Each rank contributes local PR, all ranks receive full gathered array, remap to global IDs.
+
+Why this is usually better than manual root gather+broadcast:
+- Removes explicit root-managed handshake and uses optimized collective routines.
+
+
+C) 15 pts: Scenario 3 (Asynchronous Overlap)
+What evaluator checks:
+- Correct non-blocking communication pattern.
+- Real overlap of communication and computation.
+- Correctness preserved while overlapping.
+
+Where implemented:
+- src/pagerank_async.c
+
+Used MPI primitives:
+- MPI_Irecv, MPI_Isend, MPI_Waitall, MPI_Allreduce
+
+Overlap logic in current code:
+1. Post non-blocking receives/sends
+2. Compute internal vertices immediately
+3. Wait for communication completion
+4. Compute boundary vertices
+
+Why this can score highest:
+- It demonstrates performance-oriented distributed design beyond correctness.
+
+Important validation note:
+- Your runs show convergence in 2 iterations for async while others converge around 75.
+- For full correctness confidence, include a direct numerical comparison across scenarios.
+
+
+16.4 Analysis Report (20 total)
+-------------------------------
+
+A) 10 pts: Scaling and comparison plots
+What evaluator checks:
+- Strong-scaling or runtime comparison across np values.
+- Visual evidence (plots/tables) comparing all scenarios.
+
+What data you already have:
+- Wall times for np = 2, 4, 8, 16 for all three scenarios.
+
+What to include for full marks:
+1. Runtime vs process count plot for each scenario.
+2. Speedup plot: T2/Tp or T1/Tp depending on available baseline.
+3. Efficiency plot: speedup/p.
+4. Short interpretation of non-ideal scaling reasons.
+
+
+B) 10 pts: Deep dive on overlap efficiency and edge-cut impact
+What evaluator checks:
+- You must explain why async helps (or does not) using measured behavior.
+- You must connect partition quality to communication cost.
+
+What to analyze:
+1. Overlap efficiency:
+  - Compare Scenario 2 vs Scenario 3 runtime trends.
+  - Explain internal/boundary ratio effect.
+2. Edge-cut impact:
+  - Estimate cross-partition communication demand (ghost counts, boundary counts).
+  - Explain how higher edge cut increases remote dependencies and communication time.
+
+What to include for full marks:
+1. Rank-wise table: internal, boundary, ghosts.
+2. Communication-heavy vs compute-heavy phase discussion.
+3. Clear statement: "This partitioning caused X communication behavior because ..."
+
+
+16.5 Suggested Rubric-Ready Checklist
+-------------------------------------
+Before submission, verify you can show all items below:
+
+1. Formula correctness
+- PageRank equation and convergence criterion documented.
+
+2. Validation
+- top-10 ranks printed and compared.
+- sum(PR) approx 1 and non-negativity checks reported.
+
+3. Partitioning
+- clear statement whether linear or ParMETIS partitioning is used.
+- edge-cut or ghost/boundary statistics provided.
+
+4. Three MPI scenarios
+- P2P, collective, async all executed and compared under same dataset.
+
+5. Scaling report
+- plots/tables for np = 2,4,8,16 with interpretation.
+
+6. Deep analysis
+- overlap efficiency discussion.
+- edge-cut/communication impact discussion.
+
+
+16.6 Honest Assessment Against Rubric (Current Code Snapshot)
+-------------------------------------------------------------
+Based on current implementation state:
+
+1. Functional correctness:
+- Strong implementation of iterative PageRank and convergence mechanism.
+- Validation section should be expanded with explicit numerical checks.
+
+2. Data and partitioning:
+- Redistribution and internal/boundary/ghost logic are implemented.
+- Edge-cut minimization objective is not fully met because true ParMETIS partitioning is not currently used in partition_graph.
+
+3. MPI scenarios:
+- All three scenarios are implemented with expected MPI primitives.
+- Async scenario should be validated carefully against other scenarios due to very early convergence behavior.
+
+4. Analysis report readiness:
+- Timing data exists and can support scaling plots.
+- Need explicit deep-dive narrative and plots for overlap and edge-cut impact.
